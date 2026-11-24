@@ -9,8 +9,8 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
-/// `t<root parameter index>` in this space.
+/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
+/// `t<root parameter index>` and `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
@@ -63,8 +63,10 @@ pub(crate) struct Shader {
     pub cmp_samplers: u64,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
-    /// Root SRVs (raw buffers) read, likewise.
-    pub root_srvs: Vec<(u8, V)>,
+    /// Root SRVs (raw, structured or typed buffers) read: (slot, props, handle).
+    pub root_srvs: Vec<(u8, (u32, u32), V)>,
+    /// Root UAVs (raw, structured or typed buffers) read or written: (slot, props, handle).
+    pub root_uavs: Vec<(u8, (u32, u32), V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -120,6 +122,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -212,10 +215,10 @@ impl Shader {
         h
     }
 
-    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
-    pub fn root_srv_handle(&mut self, slot: u8) -> V {
-        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
-            return h;
+    /// The handle of the root SRV of root parameter `slot` with `props`.
+    pub fn root_srv_handle(&mut self, slot: u8, props: (u32, u32)) -> Option<V> {
+        if let Some(&(_, existing, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+            return (existing == props).then_some(h);
         }
         let r = self.m.i32(u32::from(slot));
         let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
@@ -230,10 +233,38 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11, 0);
-        self.flags |= flags::RAW_BUFFERS;
-        self.root_srvs.push((slot, h));
-        h
+        let h = self.annotate(block, h, props.0, props.1);
+        if matches!(props.0 & 0xFF, 11 | 12) {
+            self.flags |= flags::RAW_BUFFERS;
+        }
+        self.root_srvs.push((slot, props, h));
+        Some(h)
+    }
+
+    /// The handle of the root UAV of root parameter `slot` with `props`.
+    pub fn root_uav_handle(&mut self, slot: u8, props: (u32, u32)) -> Option<V> {
+        if let Some(&(_, existing, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return (existing == props).then_some(h);
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, props.0, props.1);
+        if matches!(props.0 & 0xFF, 11 | 12) {
+            self.flags |= flags::RAW_BUFFERS;
+        }
+        self.root_uavs.push((slot, props, h));
+        Some(h)
     }
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
@@ -318,6 +349,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -371,15 +403,49 @@ impl Shader {
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
+            let buffer_meta =
+                |s: &mut Self, props: (u32, u32), uav: bool| -> (Ty, Option<Md>, u32, u32) {
+                    let dxil_kind = props.0 & 0xFF;
+                    let prefix = if uav { "RW" } else { "" };
+                    match dxil_kind {
+                        12 => {
+                            let i8t = s.m.int(8);
+                            let elem = s.m.array(props.1.max(1), i8t);
+                            let ty = s.m.named_struct(
+                                &format!("struct.{prefix}StructuredBuffer.{}", props.1),
+                                vec![elem],
+                            );
+                            let t0 = Some(i32c(s, 1));
+                            let t1 = Some(i32c(s, props.1));
+                            let tags = s.m.md_node(vec![t0, t1]);
+                            (ty, Some(tags), if uav { 8 } else { 5 }, 12)
+                        }
+                        10 => {
+                            let ty = s
+                                .m
+                                .named_struct(&format!("class.{prefix}Buffer"), vec![s.t.f32]);
+                            let elem_ty = props.1 & 0xF;
+                            let t0 = Some(i32c(s, 0));
+                            let t1 = Some(i32c(s, if elem_ty == 0 { 9 } else { elem_ty }));
+                            let tags = s.m.md_node(vec![t0, t1]);
+                            (ty, Some(tags), if uav { 6 } else { 3 }, 10)
+                        }
+                        _ => {
+                            let ty = s.m.named_struct(
+                                &format!("struct.{prefix}ByteAddressBuffer"),
+                                vec![s.t.i32],
+                            );
+                            (ty, None, if uav { 7 } else { 4 }, 11)
+                        }
+                    }
+                };
             let mut srvs = None;
             if !self.root_srvs.is_empty() {
-                let ty = self
-                    .m
-                    .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (slot, props, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                    let (ty, tags, psv_kind, dxil_kind) = buffer_meta(&mut self, props, false);
+                    let p = self.m.ptr(ty);
+                    let u = self.m.undef(p);
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -387,16 +453,16 @@ impl Shader {
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, dxil_kind)),
                         Some(i32c(&mut self, 0)),
-                        None,
+                        tags,
                     ];
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
-                        kind: 4,
+                        kind: psv_kind,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
-                        dxil_kind: 11,
+                        dxil_kind,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
@@ -430,12 +496,45 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let bfalse = self.m.bool(false);
+                let bfalse = self.m.md_value(bfalse);
+                let mut list = Vec::new();
+                for (n, (slot, props, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    let (ty, tags, psv_kind, dxil_kind) = buffer_meta(&mut self, props, true);
+                    let p = self.m.ptr(ty);
+                    let u = self.m.undef(p);
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, dxil_kind)),
+                        Some(bfalse),
+                        Some(bfalse),
+                        Some(bfalse),
+                        tags,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: psv_kind,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs, UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
-                _ => 2,
+                3..=5 => 2,
+                _ => 3,
             });
         }
         if let Some(r) = resources {

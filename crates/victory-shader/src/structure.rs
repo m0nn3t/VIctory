@@ -345,8 +345,13 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Mask meanings that are uniform, constant or opaque, but still valid
+    /// lane booleans at a `v_cndmask_b32` or carry-in select.
+    pub(crate) other_masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Exact Wave64 pairs for uniform/constant/opaque mask values.
+    paired_other_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -358,10 +363,17 @@ pub struct Structured {
 impl Structured {
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
-            Some(high) => self.paired_masks.get(&(low, high)),
-            None => self.masks.get(&low),
+            Some(high) => self
+                .paired_masks
+                .get(&(low, high))
+                .or_else(|| self.paired_other_masks.get(&(low, high)))
+                .copied(),
+            None => self
+                .masks
+                .get(&low)
+                .or_else(|| self.other_masks.get(&low))
+                .copied(),
         }
-        .copied()
     }
 }
 
@@ -624,15 +636,28 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
-        Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            highs: self
-                .masks
+        let mut highs: HashMap<Value, Value> = self
+            .masks
+            .keys()
+            .filter(|(lo, hi)| lo != hi)
+            .map(|&(lo, hi)| (hi, lo))
+            .collect();
+        highs.extend(
+            self.other
                 .keys()
                 .filter(|(lo, hi)| lo != hi)
-                .map(|&(lo, hi)| (hi, lo))
+                .map(|&(lo, hi)| (hi, lo)),
+        );
+        Ok(Structured {
+            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other_masks: self
+                .other
+                .iter()
+                .map(|(&(lo, _), &m)| (lo, m))
                 .collect(),
+            highs,
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_other_masks: if self.p.wave64 { self.other } else { Map::default() },
             active: self.active,
             bools: self.b,
             exits,
@@ -1230,5 +1255,32 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn cndmask_tracks_an_uniform_sgpr_mask() {
+        let cndmask = [
+            0xD400_0000 | (0x101u32 << 16), // v_cndmask_b32_e64
+            0x80 | (0x81 << 9) | (20 << 18),
+        ];
+        let p = build(
+            &[
+                0xBE94_0300, // s_mov_b32 s20, s0
+                cndmask[0],
+                cndmask[1],
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let inst = &p.blocks[0].insts[1];
+        assert_eq!(inst.name(), "v_cndmask_b32");
+        let mask = inst.read(Reg::S(20)).unwrap();
+        assert!(
+            s.mask_bits(mask, None).is_some(),
+            "uniform SGPR {:?} should be a tracked select mask",
+            mask
+        );
+        assert!(s.other_masks.contains_key(&mask));
     }
 }
