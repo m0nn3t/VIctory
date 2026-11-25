@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -901,11 +902,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2809,6 +2812,87 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(a) = self.scalar.get(&site).copied()
+            && let Some(rp) = self.x.native.layout.get(a.param)
+            && rp.root == RootType::Descriptor
+        {
+            let count = match name.strip_prefix("s_load_dword") {
+                Some("") => 1,
+                Some("x2") => 2,
+                Some("x4") => 4,
+                Some("x8") => 8,
+                Some("x16") => 16,
+                _ => 0,
+            };
+            if count != 0 {
+                let Some(Operand::Scalar { code, .. }) = *data else {
+                    return Err("a scalar memory read as data");
+                };
+                let src = Source::Built {
+                    address: a,
+                    bits: 0,
+                    words: [0, 0],
+                };
+                let kind = self
+                    .x
+                    .native
+                    .used
+                    .iter()
+                    .find(|u| u.root == rp.root && u.user_data == rp.user_data)
+                    .map(|u| u.kind);
+                let c = self.cur;
+                let mut base = self.s.m.i32(a.offset);
+                if let Some(dynamic) = a.dynamic {
+                    let d = self.i32_of(dynamic)?;
+                    base = self.s.m.bin(c, Bin::Add, base, d);
+                }
+                if matches!(kind, Some(ResourceType::Cbv) | None) {
+                    let h = self.handle(site, &src, false, (13, 0x1_0000))?;
+                    for k in 0..count {
+                        let at = if k == 0 {
+                            base
+                        } else {
+                            let off = self.s.m.i32(4 * k);
+                            self.s.m.bin(c, Bin::Add, base, off)
+                        };
+                        let x = self.cbuffer_dword(h, at);
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                    return Ok(());
+                }
+                let u = if kind == Some(ResourceType::Uav) {
+                    0x1000
+                } else {
+                    0
+                };
+                let h = self.handle(site, &src, false, (11 | u, 0))?;
+                for k in 0..count {
+                    let at = if k == 0 {
+                        base
+                    } else {
+                        let off = self.s.m.i32(4 * k);
+                        self.s.m.bin(c, Bin::Add, base, off)
+                    };
+                    let (u, mask, align) = (
+                        self.s.m.undef(self.s.t.i32),
+                        self.s.m.i8(1),
+                        self.s.m.i32(4),
+                    );
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, at, u, mask, align],
+                    );
+                    let loaded = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(loaded);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -2980,7 +3064,7 @@ impl<'a> Lower<'a> {
                 ((kind | u, 0x409), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
+                let stride = used.map_or(4, |u| if u.stride >= 4 && u.stride.is_multiple_of(4) { u.stride } else { 4 });
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
@@ -3354,14 +3438,30 @@ impl<'a> Lower<'a> {
                     .native
                     .used
                     .iter()
-                    .find(|u| u.user_data == rp.user_data)
+                    .find(|u| u.root == rp.root && u.user_data == rp.user_data)
                     .map(|u| u.kind);
+                let dxil_kind = props.0 & 0xFFF;
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
+                    (RootType::Descriptor, Some(ResourceType::Srv), 10..=12) => self
+                        .s
+                        .root_srv_handle(rp.slot, props)
+                        .ok_or("a root SRV used with two layouts"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), _)
+                        if matches!(dxil_kind, 8..=15) =>
+                    {
+                        self.s
+                            .root_uav_handle(rp.slot, (dxil_kind | 0x1000, props.1))
+                            .ok_or("a root UAV used with two layouts")
+                    }
+                    (RootType::Descriptor, None, _)
+                        if props.0 & 0x1000 != 0 && matches!(dxil_kind, 8..=15) =>
+                    {
+                        self.s
+                            .root_uav_handle(rp.slot, props)
+                            .ok_or("a root UAV used with two layouts")
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
@@ -4182,7 +4282,7 @@ impl<'a> Lower<'a> {
                         _ => None,
                     };
                     let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
+                        .and_then(|m| self.x.st.mask_bits(m, None))
                         .ok_or("a carry-in from an untracked mask")?;
                     Some(self.boolean(m, c)?)
                 } else {
@@ -6277,10 +6377,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = used.map_or(4, |u| if u.stride >= 4 && u.stride.is_multiple_of(4) { u.stride } else { 4 });
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
@@ -6360,10 +6457,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = used.map_or(4, |u| if u.stride >= 4 && u.stride.is_multiple_of(4) { u.stride } else { 4 });
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -6421,10 +6515,7 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = used.map_or(4, |u| if u.stride >= 4 && u.stride.is_multiple_of(4) { u.stride } else { 4 });
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     self.s.op(
                         c,
@@ -7047,6 +7138,67 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn scalar_memory_load_from_root_constants_lowers() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            125 << 25,
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        let lowered = lower_with(&words, layout, vec![]);
+        assert!(lowered.is_ok(), "scalar root-constants SMEM load should lower");
+    }
+
+    #[test]
+    fn root_uav_raw_and_structured_lower() {
+        // Build a 4-dword V# around root descriptor s[0:1] (slot 2) and store
+        // v0 to it: raw (no idxen) and structured (idxen, stride 4).
+        let make = |idxen: bool, stride: u32| {
+            let mut words = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0301, // s_mov_b32 s5, s1
+                0xBE86_03C1, // s_mov_b32 s6, -1
+                0xBE87_03FF,
+                0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+                0x7E00_0287, // v_mov_b32 v0, 7
+            ];
+            if idxen {
+                // buffer_store_dword v0, v0, s[4:7], 0 idxen
+                words.extend([0x38 << 26 | 0x1C << 18 | 1 << 13, 0x80 << 24 | (4 >> 2) << 16]);
+            } else {
+                // buffer_store_dword v0, off, s[4:7], 0
+                words.extend([0x38 << 26 | 0x1C << 18, 0x80 << 24 | (4 >> 2) << 16]);
+            }
+            words.push(S_ENDPGM);
+            let layout = vec![root(RootType::Descriptor, 0, 2)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 2,
+            }];
+            let l = lower_with(&words, layout, used).unwrap();
+            assert_eq!(l.root_uavs, vec![2]);
+            assert!(l.root_cbvs.is_empty());
+            assert!(l.root_srvs.is_empty());
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut l.dxil.clone()).unwrap();
+            }
+        };
+        make(false, 0);
+        make(true, 4);
     }
 
     #[test]
